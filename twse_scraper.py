@@ -3,6 +3,7 @@ import logging
 import time
 import io
 import warnings
+import csv
 from datetime import date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,7 +45,7 @@ def fetch_data(session: requests.Session, url: str, params: Dict = None, descrip
             warnings.simplefilter("ignore", InsecureRequestWarning)
             response = session.get(url, params=params, headers=HEADERS, timeout=15, verify=False)
         response.raise_for_status()
-        if len(response.content) < 100:
+        if len(response.content) < 200:
             logging.warning(f"{description} 可能沒有交易資料。")
             return None
         return response.content
@@ -53,10 +54,11 @@ def fetch_data(session: requests.Session, url: str, params: Dict = None, descrip
         return None
 
 def parse_twse_csv(csv_content: str, name: str) -> pd.DataFrame:
-    """專門解析三種不同結構TWSE CSV的函式"""
+    """專門解析三種不同結構TWSE CSV的函式 (最終手動解析標頭版)"""
     try:
-        lines = csv_content.strip().split('\n')
+        lines = [line for line in csv_content.strip().split('\n') if line.strip()]
         if len(lines) < 2: return pd.DataFrame()
+        
         header_row_index = -1
         for i, line in enumerate(lines):
             if '證券代號' in line and '證券名稱' in line:
@@ -70,13 +72,27 @@ def parse_twse_csv(csv_content: str, name: str) -> pd.DataFrame:
             df.columns = df.columns.str.strip().str.replace('=', '').str.replace('"', '')
             df = df.rename(columns={'買進股數': '投信_買進股數', '賣出股數': '投信_賣出股數', '買賣超股數': '投信_買賣超股數'})
         elif name in ['外資', '自營商']:
-            df_multi = pd.read_csv(io.StringIO(csv_content), thousands=',', header=[header_row_index, header_row_index + 1], skiprows=header_row_index)
-            df_multi.columns = pd.MultiIndex.from_tuples([(str(c1).strip().replace('=', '').replace('"', ''), str(c2).strip()) for c1, c2 in df_multi.columns])
+            # --- 核心修正：手動解析雙層標頭 ---
+            header_line_1 = list(csv.reader(io.StringIO(lines[header_row_index])))[0]
+            header_line_2 = list(csv.reader(io.StringIO(lines[header_row_index + 1])))[0]
+            data_rows = [list(csv.reader(io.StringIO(line)))[0] for line in lines[header_row_index + 2:]]
+
+            # 建立正確的雙層標頭
+            columns = []
+            current_top_level = ""
+            for i in range(len(header_line_1)):
+                top_level = header_line_1[i].strip().replace('=', '').replace('"', '')
+                if top_level: current_top_level = top_level
+                sub_level = header_line_2[i].strip().replace('=', '').replace('"', '')
+                columns.append((current_top_level, sub_level))
+            
+            df_multi = pd.DataFrame(data_rows, columns=pd.MultiIndex.from_tuples(columns))
+            # --- 手動解析結束 ---
+            
             df = pd.DataFrame()
-            stock_id_col = [col for col in df_multi.columns if col[0] == '證券代號'][0]
-            stock_name_col = [col for col in df_multi.columns if col[0] == '證券名稱'][0]
-            df['證券代號'] = df_multi[stock_id_col]
-            df['證券名稱'] = df_multi[stock_name_col]
+            df['證券代號'] = df_multi[('證券代號', '證券代號')]
+            df['證券名稱'] = df_multi[('證券名稱', '證券名稱')]
+            
             if name == '外資':
                 df['外資_買進股數'] = df_multi[('外資及陸資', '買進股數')]
                 df['外資_賣出股數'] = df_multi[('外資及陸資', '賣出股數')]
@@ -88,9 +104,15 @@ def parse_twse_csv(csv_content: str, name: str) -> pd.DataFrame:
                 df['自營商_避險_買進股數'] = df_multi[('自營商(避險)', '買進股數')]
                 df['自營商_避險_賣出股數'] = df_multi[('自營商(避險)', '賣出股數')]
                 df['自營商_避險_買賣超股數'] = df_multi[('自營商(避險)', '買賣超股數')]
+
         df = df[~df['證券代號'].astype(str).str.contains('計')]
         df = df.dropna(subset=['證券代號'])
         df['證券代號'] = df['證券代號'].astype(str).str.strip()
+        # 將所有數值欄位轉為數字
+        for col in df.columns:
+            if '股數' in str(col):
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
         return df
     except Exception as e:
         logging.error(f"解析 TWSE ({name}) CSV資料時發生失敗: {e}", exc_info=True)
@@ -112,11 +134,9 @@ def parse_tpex_csv(csv_content: str) -> pd.DataFrame:
         df = df.rename(columns={'代號': '證券代號', '名稱': '證券名稱'})
         df['證券代號'] = df['證券代號'].astype(str).str.strip()
         columns_to_keep = [
-            '證券代號', '證券名稱',
-            '外資及陸資買進股數', '外資及陸資賣出股數', '外資及陸資買賣超股數',
-            '投信買進股數', '投信賣出股數', '投信買賣超股數',
-            '自營商(自行買賣)買進股數', '自營商(自行買賣)賣出股數', '自營商(自行買賣)買賣超股數',
-            '自營商(避險)買進股數', '自營商(避險)賣出股數', '自營商(避險)買賣超股數',
+            '證券代號', '證券名稱', '外資及陸資買進股數', '外資及陸資賣出股數', '外資及陸資買賣超股數',
+            '投信買進股數', '投信賣出股數', '投信買賣超股數', '自營商(自行買賣)買進股數', '自營商(自行買賣)賣出股數',
+            '自營商(自行買賣)買賣超股數', '自營商(避險)買進股數', '自營商(避險)賣出股數', '自營商(避險)買賣超股數',
         ]
         final_columns_to_select = []
         rename_map_suffix = {}
@@ -173,7 +193,8 @@ def process_day(target_date: date, stock_map: Dict[str, str]):
             time.sleep(0.5)
         if twse_dfs:
             twse_market_df = merge_dataframes(twse_dfs)
-            if not twse_market_df.empty: twse_market_df['日期'] = pd.to_datetime(target_date)
+            if not twse_market_df.empty:
+                twse_market_df['日期'] = pd.to_datetime(target_date)
 
         params_tpex = {'d': date_str_tpex, 't': 'D', 'o': 'csv'}
         content_bytes = fetch_data(session, TPEX_SOURCE_URL, params=params_tpex, description=f"TPEX {target_date}")
